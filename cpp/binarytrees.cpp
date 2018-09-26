@@ -20,7 +20,11 @@
 
 //#define ALLOC_SHARED
 //#define ALLOC_UNIQUE
-// todo intrutrsive shared ptr
+// else use intrusive deleter
+
+#define USE_FIXEDPOOL
+
+
 //
 const size_t    LINE_SIZE = 64;
 
@@ -43,7 +47,87 @@ public:
 template<class T>
 using DeleteFunc = std::function<void(T*)>;
 
-struct Node 
+template<class T>
+struct IDeallocator
+{
+    virtual void deallocate(T* p) = 0;
+    virtual ~IDeallocator() {}
+};
+
+template<class A, class T>
+using member_deallocate_pointer = void (A::*)(T*); 
+
+struct RefDeallocator_Tag
+{
+};
+
+struct CopyDeallocator_Tag
+{
+};
+
+// Deallocator implements deallocato(T*)
+template<class T, class SaveDeallocTag = RefDeallocator_Tag , class Deallocator = IDeallocator<T>, member_deallocate_pointer<Deallocator, T> DelFunc = &Deallocator::deallocate>
+struct IDeallocatable
+{
+    using value_type = T;
+    using deallocator_type = Deallocator;
+    static constexpr bool is_deallocator_copied = std::is_same<SaveDeallocTag, CopyDeallocator_Tag>::value;
+    using saved_deallocator_type = std::conditional_t< is_deallocator_copied, std::optional<deallocator_type>,  deallocator_type*>;
+
+//    static constexpr saved_deallocator_type null_deallocator = std::conditional_t< std::is_same_v<SaveDeallocTag, CopyDeallocator_Tag>, std::nullopt,  nullptr>;
+
+    IDeallocatable(deallocator_type &dealloc) {
+        set_deallocator(dealloc);
+    }
+
+    IDeallocatable() {}
+
+    IDeallocatable(const IDeallocatable& ) {}
+    IDeallocatable& operator=(const IDeallocatable&) {
+        return this;
+    }
+
+    void set_deallocator( deallocator_type &dealloc) {
+        if constexpr( is_deallocator_copied )
+            mDeallocator = dealloc;
+        else
+            mDeallocator = &dealloc;
+    }
+    void reset_deallocator() {
+            mDeallocator = saved_deallocator_type();
+    }
+
+    const auto &get_deallocator() const {
+        return mDeallocator;
+    }
+
+    auto &get_deallocator()  {
+        return mDeallocator;
+    }
+
+    void deallocate_me() {
+        if( auto& d = get_deallocator() ) {
+            reset_deallocator();
+            static_cast<T*>(this)->~T(); // call destructor
+            ((*d).*DelFunc)(static_cast<T*>(this));
+        }
+    }
+
+    virtual ~IDeallocatable() {
+        if( auto& d = get_deallocator() ) {
+            reset_deallocator();
+            ((*d).*DelFunc)(static_cast<T*>(this));
+        }
+    }
+private:
+    saved_deallocator_type mDeallocator = saved_deallocator_type();
+};
+
+template <class T, class D>
+using IDeleter = IDeallocatable<T, CopyDeallocator_Tag, D, &D::operator()>;
+
+
+struct Node : IDeallocatable<Node>
 {
 #ifdef ALLOC_SHARED
     using Ptr = std::shared_ptr<Node> ;
@@ -66,6 +150,11 @@ struct Node
 using NodePtr =  typename Node::Ptr;
 
 template<class T>
+struct null_delete{
+    void operator()(T* ){}
+};
+
+template<class T, class Deleter = std::default_delete<T> >
 struct FreeList
 {
     struct FreeNode
@@ -76,7 +165,9 @@ struct FreeList
         FreeNode(FreeNode *next = nullptr):pNext(next){}
     };
 
-    FreeList(T *p = nullptr): pHead( reinterpret_cast<FreeNode*>(p)){}
+    FreeList(T *p = nullptr, const Deleter& d ={}): pHead( reinterpret_cast<FreeNode*>(p)),mDel(d) {}
+
+    FreeList(const Deleter& d):mDel(d){}
 
     void push(T &p){
         new (reinterpret_cast<FreeNode*>(&p)) FreeNode(pHead);
@@ -92,60 +183,71 @@ struct FreeList
     bool empty() const {
         return !pHead;
     }
-    void clear() {
+
+    template<class D = Deleter>
+    typename std::enable_if<std::is_same<D, null_delete<T>>::value, void >::type clear() {
+        pHead = nullptr;
+    }
+
+    template<class D = Deleter>
+    typename std::enable_if<!std::is_same<D, null_delete<T>>::value, void >::type clear() {
+        while( auto p=pop() ) {
+            mDel( p );
+        }
         pHead = nullptr;
     }
 
     FreeNode *pHead = nullptr;
+    Deleter mDel;
 };
 
-template<typename T, size_t BlockSize = sizeof(T), class Alloc = std::allocator<T> , class FreeList = FreeList<T> >
-class FreePool
+
+
+// allocate when constructing BasePool
+// ChildT implements: T *do_alloc()
+template<class T, class FreeList, class ChildT >
+class BasePool : IDeallocator<T>
 {
 public:
-    // if nBlocks > 0, pre-allocate memory
-    // if nBlocks == 0, dynamically allocate memory
-    FreePool(size_t nBlocks=0, const Alloc &a=Alloc(), const FreeList& freeList=FreeList())
-        : mAlloc(a), freeList(freeList), mMemSize(BlockSize * nBlocks)
-    {
-        if( !mMemSize ) return;
-        mCurrent = mMem = new char[mMemSize];
-        assert(mMem);
-        if(!mMem) {
-            throw std::bad_alloc();
-        }
-        clear();
+    using child_type = ChildT;
+//    using T = typename ChildT::value_type;
+//    using FreeList = typename ChildT::freelist_type;
+
+
+    BasePool( const FreeList& fl): freeList(fl) {}
+
+    FreeList& get_freelist(){
+        return freeList;
     }
 
-    ~FreePool() 
-    {
-        if( mMem )
-        delete [] mMem;
-    }
-
-    T* alloc()
+    T* allocate()
     {
         if( auto p = freeList.pop() )
             return p;
-        else
-            return alloc0();    
+        else {
+//            auto pChild = dynamic_cast<child_type*>(this);
+//            assert(pChild && "Unable to get child");
+//            return pChild->do_alloc();
+            return do_alloc();
+        }
     }
 
-    T* alloc0()
-    {
-        if( !mMemSize ) {
-            return mAlloc.allocate(1);
+    virtual T* do_alloc() = 0;
+
+    template<class... Args>
+    T* create(Args&&... args) {
+        if( auto p = allocate() ) {
+            new(p) T(std::forward<Args>(args)...);
+            p->set_deallocator(*this);
+            return p;
         }
-        if( mCurrent + BlockSize > mMem + mMemSize ) return nullptr;
-        auto res = reinterpret_cast<T*> (mCurrent);
-        mCurrent += BlockSize;
-        return res;
+        return nullptr;
     }
 
     template<class... Args>
-    std::shared_ptr<T> allocate_shared(Args&&... args)
+    std::shared_ptr<T> create_shared(Args&&... args)
     {
-        if( auto p = alloc() ) {
+        if( auto p = allocate() ) {
             new (p) T(std::forward<Args>(args)...);
             return {p, [this](T* pObj){ deallocate(pObj);} };
         }
@@ -153,16 +255,16 @@ public:
     }
 
     template<class... Args>
-    std::unique_ptr<T, DeleteFunc<T>> allocate_unique(Args&&... args)
+    std::unique_ptr<T, DeleteFunc<T>> create_unique(Args&&... args)
     {
-        if( auto p = alloc() ) {
+        if( auto p = allocate() ) {
             new (p) T(std::forward<Args>(args)...);
             return {p,[this](T* pObj){ deallocate(pObj);} };
         }
         return nullptr;
     }
 
-    void deallocate(T* p)
+    void deallocate(T* p) override
     {
         assert(p);
         freeList.push(*p);
@@ -171,15 +273,99 @@ public:
     void clear() // reset
     {
         freeList.clear();
+    }
+
+protected:
+    FreeList freeList;
+};
+
+// allocate when custructing FreePool
+template<typename T, class Alloc = std::allocator<T> , class FreeList = FreeList<T, null_delete<T>> >
+class FixedPool : BasePool<T, FreeList, FixedPool<T, Alloc,FreeList> >
+{
+public:
+    using this_type = FixedPool;
+    using parent_type = BasePool<T, FreeList, this_type >;
+
+    using parent_type::create;
+
+    // pre-allocate memory. memory will be deleted when FreePool destructs.
+    // T must be IDeallocatable
+    FixedPool(size_t nBlocks, const Alloc &a=Alloc(), const FreeList& freeList=FreeList())
+        : parent_type(freeList), mAlloc(a), mBlocks(nBlocks)
+    {
+        if( !nBlocks ) return;
+        mCurrent = mMem = mAlloc.allocate(mBlocks);
+        assert(mMem);
+        if(!mMem) {
+            throw std::bad_alloc();
+        }
+    }
+
+    ~FixedPool() 
+    {
+        if(mMem) {
+            mAlloc.deallocate( mMem, mBlocks );
+            mMem = nullptr;
+        }
+    }
+
+    T* do_alloc()
+    {
+        if( mCurrent + 1 > mMem + mBlocks ) return nullptr;
+        auto res = (mCurrent);
+        mCurrent += 1;
+        return res;
+    }
+
+    void clear() // reset
+    {
+        parent_type::clear();
         mCurrent = mMem;
     }
 
 protected:
     Alloc mAlloc;
-    const size_t mMemSize;
-    char *mMem = nullptr;
-    char *mCurrent;
-    FreeList freeList;
+    const size_t mBlocks;
+    T *mMem = nullptr;
+    T *mCurrent;
+};
+
+// allocate when needed
+template<typename T, class Alloc = std::allocator<T> , class FreeList = FreeList<T, std::default_delete<T>> >
+class PoolAllocator  : BasePool<T, FreeList, PoolAllocator<T, Alloc, FreeList> >
+{
+public:
+    using this_type = PoolAllocator;
+    using parent_type = BasePool<T, FreeList, this_type >;
+
+    using parent_type::create;
+
+
+    // pre-allocate memory. memory will be deleted when FreePool destructs.
+    // T must be IDeallocatable
+    PoolAllocator( const Alloc &a=Alloc(), const FreeList& freeList=FreeList())
+        : parent_type(freeList), mAlloc(a)
+    {
+    }
+
+    PoolAllocator( size_t n, const Alloc &a=Alloc(), const FreeList& freeList=FreeList())
+        : parent_type(freeList), mAlloc(a)
+    {
+    }
+
+    T* do_alloc()
+    {
+        mAlloc.allocate(1);
+    }
+
+    void clear() // reset
+    {
+        parent_type::clear();
+    }
+
+protected:
+    Alloc mAlloc;
 };
 
 template<typename T, size_t BlockSize = sizeof(T)>
@@ -203,7 +389,7 @@ public:
         //apr_pool_destroy(pool);
     }
 
-    T* alloc()
+    T* create()
     {
         if( mCurrent + BlockSize > mMem + mMemSize ) return nullptr;
         auto res = reinterpret_cast<T*> (mCurrent);
@@ -211,7 +397,7 @@ public:
         return res;
     }
 
-    void dealloc(T* p)
+    void deallocate(T* p)
     {
     }
 
@@ -227,17 +413,22 @@ protected:
     char *mCurrent;
 };
 
-typedef FreePool<Node> NodePool;
+#ifdef USE_FIXEDPOOL
+typedef FixedPool<Node> NodePool;
+#else
+typedef PoolAllocator<Node> NodePool;
+#endif
+
 //typedef Pool<Node> NodePool;
 
 NodePtr make(int d, NodePool &store)
 {
 #ifdef ALLOC_SHARED
-    auto root = store.allocate_shared();
+    auto root = store.create_shared();
 #elif defined( ALLOC_UNIQUE )
-    auto root = store.allocate_unique();
+    auto root = store.create_unique();
 #else
-    auto root = store.alloc();
+    auto root = store.create();
 #endif
     assert(root);
 
