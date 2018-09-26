@@ -1,0 +1,8 @@
+[package]
+name = "binarytrees"
+version = "0.1.0"
+authors = ["Will Good <willgood@noemail>"]
+
+[dependencies]
+typed-arena = "1.4.1"
+rayon = "1.0.2"
