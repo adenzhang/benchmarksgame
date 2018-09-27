@@ -24,6 +24,8 @@
 
 #define USE_FIXEDPOOL
 
+// fro shared_ptr or unique_ptr
+#define USE_DELETERADAPTOR
 
 //
 const size_t    LINE_SIZE = 64;
@@ -47,6 +49,9 @@ public:
 template<class T>
 using DeleteFunc = std::function<void(T*)>;
 
+template<class A, class T>
+using member_deallocate_pointer = void (A::*)(T*); 
+
 template<class T>
 struct IDeallocator
 {
@@ -54,8 +59,55 @@ struct IDeallocator
     virtual ~IDeallocator() {}
 };
 
-template<class A, class T>
-using member_deallocate_pointer = void (A::*)(T*); 
+template<class T>
+struct IDeleter
+{
+    virtual void operator()(T* p) = 0;
+    virtual ~IDeleter() {}
+};
+
+template<class T, class D = IDeleter<T>, member_deallocate_pointer<D, T> pDelFn = static_cast<member_deallocate_pointer<D, T>>(&D::operator())>
+struct DeleterAdaptor
+{
+    D *d;
+    DeleterAdaptor( D* d = nullptr):d(d){}
+
+    void operator()(T* p){
+        assert(d);
+        ((*d).*pDelFn)(p);
+    }
+};
+
+// most generic deleter which calls pDelFn( T*, D& ) to delete
+// D must be copy constructible
+// it can be used as deleter or deallocator
+template<class T, class D = void *>
+struct GenDeleter
+{
+    using DelFn = void (*)(T*, D&);
+
+    DelFn pDelFn = nullptr;
+    D pDeleter = D();
+
+    template<class DT>
+    GenDeleter( DelFn pF, DT pD)
+        : pDelFn(pF)
+        , pDeleter(static_cast<D>(pD)){}
+
+    GenDeleter() = default;
+
+    void deallocate(T* p)
+    {
+        assert( pDelFn );
+        (*pDelFn)( p, pDeleter);
+    }
+
+    void operator()(T* p)
+    {
+        deallocate(p);
+    }
+};
+
 
 struct RefDeallocator_Tag
 {
@@ -65,34 +117,38 @@ struct CopyDeallocator_Tag
 {
 };
 
-// Deallocator implements deallocato(T*)
-template<class T, class SaveDeallocTag = RefDeallocator_Tag , class Deallocator = IDeallocator<T>, member_deallocate_pointer<Deallocator, T> DelFunc = &Deallocator::deallocate>
-struct IDeallocatable
+// ChildT implements call_dealloacate( T*,  D& );
+template<class ChildT, class T , class D = IDeallocator<T>, class SaveDeallocTag = CopyDeallocator_Tag>
+struct IDeletableBase
 {
     using value_type = T;
-    using deallocator_type = Deallocator;
+    using this_type = IDeletableBase;
+    using deallocator_type = D;
+
     static constexpr bool is_deallocator_copied = std::is_same<SaveDeallocTag, CopyDeallocator_Tag>::value;
+
     using saved_deallocator_type = std::conditional_t< is_deallocator_copied, std::optional<deallocator_type>,  deallocator_type*>;
 
-//    static constexpr saved_deallocator_type null_deallocator = std::conditional_t< std::is_same_v<SaveDeallocTag, CopyDeallocator_Tag>, std::nullopt,  nullptr>;
-
-    IDeallocatable(deallocator_type &dealloc) {
+    IDeletableBase(deallocator_type &dealloc) {
         set_deallocator(dealloc);
     }
 
-    IDeallocatable() {}
+    IDeletableBase() {}
 
-    IDeallocatable(const IDeallocatable& ) {}
-    IDeallocatable& operator=(const IDeallocatable&) {
+    IDeletableBase(const this_type& ) {}
+    this_type& operator=(const this_type&) {
         return this;
     }
 
-    void set_deallocator( deallocator_type &dealloc) {
-        if constexpr( is_deallocator_copied )
+    template<bool bCopy = is_deallocator_copied>
+    std::enable_if_t<bCopy, void> set_deallocator( const deallocator_type &dealloc) {
             mDeallocator = dealloc;
-        else
+    }
+    template<bool bCopy = is_deallocator_copied>
+    std::enable_if_t<!bCopy, void> set_deallocator( deallocator_type &dealloc) {
             mDeallocator = &dealloc;
     }
+    
     void reset_deallocator() {
             mDeallocator = saved_deallocator_type();
     }
@@ -109,35 +165,87 @@ struct IDeallocatable
         if( auto& d = get_deallocator() ) {
             reset_deallocator();
             static_cast<T*>(this)->~T(); // call destructor
-            ((*d).*DelFunc)(static_cast<T*>(this));
+            static_cast<ChildT*>(this)->call_deallocate(static_cast<T*>(this), *d);
         }
     }
 
-    virtual ~IDeallocatable() {
+    virtual ~IDeletableBase() {
         if( auto& d = get_deallocator() ) {
             reset_deallocator();
-            ((*d).*DelFunc)(static_cast<T*>(this));
+            static_cast<ChildT*>(this)->call_deallocate(static_cast<T*>(this), *d);
         }
     }
+
 private:
     saved_deallocator_type mDeallocator = saved_deallocator_type();
 };
 
-template <class T, class D>
-using IDeleter = IDeallocatable<T, CopyDeallocator_Tag, D, &D::operator()>;
-
-
-struct Node : IDeallocatable<Node>
+// call D(T*) to delete
+// save deallocator by default
+template<class T, class D = IDeallocator<T>, class SaveOrRefDeallocTag = CopyDeallocator_Tag >
+struct IDeletable : IDeletableBase<IDeletable<T,D, SaveOrRefDeallocTag>, T, D, SaveOrRefDeallocTag >
 {
+    using value_type = T;
+    using deallocator_type = D;
+    using this_type = IDeletable;
+    using parent_type = IDeletableBase<IDeletable<T,D, SaveOrRefDeallocTag>, T, D, SaveOrRefDeallocTag >;
+
+    IDeletable(deallocator_type &dealloc): parent_type(dealloc) {}
+
+    IDeletable() {}
+
+    void call_deallocate(T* p, D& d)
+    {
+        d(p);
+    }
+};
+
+// D implements member function void D::DelFn(T*)
+// reference to deallocator by default
+template<class T, class D = IDeallocator<T>, class SaveOrRefDeallocTag = RefDeallocator_Tag, member_deallocate_pointer<D, T> DelFn = static_cast<member_deallocate_pointer<D, T>>(&D::deallocate) >
+struct IDeallocatable : IDeletableBase<IDeallocatable<T,D, SaveOrRefDeallocTag, DelFn>, T, D, SaveOrRefDeallocTag >
+{
+    using value_type = T;
+    using deallocator_type = D;
+    using this_type = IDeallocatable;
+    using parent_type = IDeletableBase<IDeallocatable<T,D, SaveOrRefDeallocTag, DelFn>, T, D, SaveOrRefDeallocTag >;
+
+    IDeallocatable(deallocator_type &dealloc): parent_type(dealloc) {}
+
+    IDeallocatable() {}
+
+    void call_deallocate(T* p, D& d)
+    {
+        (d.*DelFn)(p);
+    }
+};
+
+// calls D(T*).
+// copy deallocator by default
+template <class T, class D = IDeleter<T>, class CopyOrRef = CopyDeallocator_Tag,  member_deallocate_pointer<D, T> DelFn = static_cast<member_deallocate_pointer<D, T>>(&D::operator())>
+using IDeletableFn = IDeallocatable<T, D, CopyOrRef, DelFn>;
+
+
+//struct Node : IDeallocatable<Node>                                    // call IDeallocator::deallocate(T*)
+struct Node : IDeletableFn<Node, IDeleter<Node>, RefDeallocator_Tag > // IDeallocator::operator()(T*)
+//struct Node : IDeletableFn<Node, GenDeleter<Node>, CopyDeallocator_Tag > 
+{
+
 #ifdef ALLOC_SHARED
     using Ptr = std::shared_ptr<Node> ;
 #elif defined( ALLOC_UNIQUE )
+
+#ifdef USE_DELETERADAPTOR
+    using Ptr = std::unique_ptr<Node, DeleterAdaptor<Node>> ;
+#else
     using Ptr = std::unique_ptr<Node, DeleteFunc<Node>> ;
+#endif
+
 #else
     using Ptr = Node*;
 #endif
 
-    Ptr l = nullptr, r = nullptr;
+    Ptr l = Ptr(), r = Ptr();
     
     int check() const 
     {
@@ -206,10 +314,13 @@ struct FreeList
 // allocate when constructing BasePool
 // ChildT implements: T *do_alloc()
 template<class T, class FreeList, class ChildT >
-class BasePool : IDeallocator<T>
+class BasePool : IDeallocator<T>, IDeleter<T>
 {
 public:
     using child_type = ChildT;
+    using this_type = BasePool;
+
+
 //    using T = typename ChildT::value_type;
 //    using FreeList = typename ChildT::freelist_type;
 
@@ -238,7 +349,12 @@ public:
     T* create(Args&&... args) {
         if( auto p = allocate() ) {
             new(p) T(std::forward<Args>(args)...);
-            p->set_deallocator(*this);
+            if constexpr( std::is_same_v<typename T::deallocator_type, GenDeleter<T>> ) {
+                p->set_deallocator(GenDeleter<T>(this_type::Deallocate, this));
+            }else{
+                p->set_deallocator(*this);
+            }
+
             return p;
         }
         return nullptr;
@@ -249,17 +365,25 @@ public:
     {
         if( auto p = allocate() ) {
             new (p) T(std::forward<Args>(args)...);
+#ifdef USE_DELETERADAPTOR
+            return {p, DeleterAdaptor<Node>(this)};
+#else
             return {p, [this](T* pObj){ deallocate(pObj);} };
+#endif
         }
         return nullptr;
     }
 
     template<class... Args>
-    std::unique_ptr<T, DeleteFunc<T>> create_unique(Args&&... args)
+    typename T::Ptr create_unique(Args&&... args)
     {
         if( auto p = allocate() ) {
             new (p) T(std::forward<Args>(args)...);
+#ifdef USE_DELETERADAPTOR
+            return {p, DeleterAdaptor<Node>(this)};
+#else
             return {p,[this](T* pObj){ deallocate(pObj);} };
+#endif
         }
         return nullptr;
     }
@@ -268,6 +392,16 @@ public:
     {
         assert(p);
         freeList.push(*p);
+    }
+
+    void operator()(T* p) override
+    {
+        deallocate(p);
+    }
+
+    static void Deallocate( T *p, void *&d)
+    {
+        static_cast<this_type*>(d)->freeList.push(*p);
     }
 
     void clear() // reset
@@ -288,6 +422,8 @@ public:
     using parent_type = BasePool<T, FreeList, this_type >;
 
     using parent_type::create;
+    using parent_type::create_unique;
+    using parent_type::create_shared;
 
     // pre-allocate memory. memory will be deleted when FreePool destructs.
     // T must be IDeallocatable
@@ -340,6 +476,8 @@ public:
     using parent_type = BasePool<T, FreeList, this_type >;
 
     using parent_type::create;
+    using parent_type::create_unique;
+    using parent_type::create_shared;
 
 
     // pre-allocate memory. memory will be deleted when FreePool destructs.
@@ -356,7 +494,7 @@ public:
 
     T* do_alloc()
     {
-        mAlloc.allocate(1);
+        return mAlloc.allocate(1);
     }
 
     void clear() // reset

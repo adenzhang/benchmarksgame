@@ -7,11 +7,13 @@ run: run_binarytrees_cpp run_binarytrees_java run_binarytrees_rust run_binarytre
 	
 build: build_binarytrees_java build_binarytrees_cpp build_binarytrees_go build_binarytrees_rust
 
-CXX=/usr/local/builds/gcc/latest/bin/g++
+CXX ?= /usr/local/builds/gcc/latest/bin/g++
+#CXX = g++
 
 ###### run #####
 run_binarytrees_cpp: build_binarytrees_cpp
 	cd cpp && time LD_LIBRARY_PATH=`dirname $(CXX)`/../lib64 ./binarytrees 21
+#	cd cpp && time ./binarytrees 21
 
 run_binarytrees_java: build_binarytrees_java
 	cd java && time java binarytrees 21
@@ -24,8 +26,7 @@ run_binarytrees_rust: build_binarytrees_rust
 
 ###### build #####
 build_binarytrees_cpp: cpp/binarytrees.cpp
-	cd cpp && $(CXX) -O3 -fomit-frame-pointer -march=native -std=c++17 -fopenmp -o binarytrees binarytrees.cpp
-#	cd cpp && g++ -O3 -DNDEBUG -fomit-frame-pointer -march=native -std=c++11 -fopenmp -o binarytrees binarytrees.cpp
+	cd cpp && $(CXX) -O3 -DNDEBUG -fomit-frame-pointer -march=native -std=c++17 -fopenmp -o binarytrees binarytrees.cpp
 
 build_binarytrees_java: java/binarytrees.java
 	cd java && javac -d .  binarytrees.java
