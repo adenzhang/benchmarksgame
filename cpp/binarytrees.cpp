@@ -22,7 +22,8 @@
 //#define ALLOC_UNIQUE
 // else use intrusive deleter
 
-#define USE_FIXEDPOOL
+//#define USE_FIXEDPOOL
+#define USE_CHUNKPOOL
 
 // fro shared_ptr or unique_ptr
 #define USE_DELETERADAPTOR
@@ -220,7 +221,7 @@ struct IDeallocatable : IDeletableBase<IDeallocatable<T,D, SaveOrRefDeallocTag, 
     }
 };
 
-// calls D(T*).
+// calls D::operator()(T*).
 // copy deallocator by default
 template <class T, class D = IDeleter<T>, class CopyOrRef = CopyDeallocator_Tag,  member_deallocate_pointer<D, T> DelFn = static_cast<member_deallocate_pointer<D, T>>(&D::operator())>
 using IDeletableFn = IDeallocatable<T, D, CopyOrRef, DelFn>;
@@ -467,6 +468,150 @@ protected:
     T *mCurrent;
 };
 
+struct ConstGrowthStrategy
+{
+    ConstGrowthStrategy(size_t initial) :value(initial){}
+    size_t next_value(){
+        return value;
+    }
+    const size_t value;
+};
+
+struct DoubleGrowthStrategy
+{
+    DoubleGrowthStrategy(size_t initial) :value(initial){}
+    size_t next_value(){
+        value *= 2;
+        return value;
+    }
+    size_t value;
+};
+
+// allocate when custructing FreePool
+template<typename T, class ChunkSizeGrowthStrategy = ConstGrowthStrategy, class Alloc = std::allocator<T> , class FreeList = FreeList<T, null_delete<T>> >
+class ChunkPool : BasePool<T, FreeList, ChunkPool<T, ChunkSizeGrowthStrategy, Alloc,FreeList> >
+{
+public:
+    using this_type = ChunkPool;
+    using parent_type = BasePool<T, FreeList, this_type >;
+
+    using parent_type::create;
+    using parent_type::create_unique;
+    using parent_type::create_shared;
+
+    static constexpr bool is_const_growth = std::is_same_v<ChunkSizeGrowthStrategy, ConstGrowthStrategy>;
+
+    // pre-allocate memory. memory will be deleted when FreePool destructs.
+    // T must be IDeallocatable
+    ChunkPool(size_t chunckSize = 16, size_t initialChunks = 0, const Alloc &a=Alloc(), const FreeList& freeList=FreeList())
+        : parent_type(freeList), mAlloc(a), mChuckSize(chunckSize), mCurrChunk(0)
+    {
+        for(size_t i=0;i< initialChunks; ++i )
+            append_chunk();
+    }
+
+    ~ChunkPool() 
+    {
+        for( auto& ch: mChunks ) {
+            if constexpr( is_const_growth )
+                mAlloc.deallocate( ch.mMem, mChuckSize.next_value() );
+            else
+                mAlloc.deallocate( ch.mMem, ch.mSize );
+            ch.clear();
+        }
+    }
+
+    T* do_alloc()
+    {
+        while(true) {
+            if( mCurrChunk >= mChunks.size() ) {
+                if( auto pChunk = append_chunk( ) ) {
+                if constexpr( is_const_growth ) 
+                    return pChunk->do_alloc(mChuckSize.next_value());
+                else
+                    return pChunk->do_alloc();
+                }else
+                    return nullptr;
+            } else {
+                auto& ch = mChunks[mCurrChunk];
+                if constexpr( is_const_growth ) {
+                    if( auto p = ch.do_alloc(mChuckSize.next_value()) )
+                        return p;
+                }else{
+                    if( auto p = ch.do_alloc() )
+                        return p;
+                }
+
+                ++mCurrChunk;
+            }
+        }
+    }
+
+    void clear() // reset/free allocated objects
+    {
+        parent_type::clear();
+        for( auto& ch: mChunks ) {
+            ch.clear();
+        }
+        mCurrChunk = 0;
+    }
+
+protected:
+
+    struct DynSizedChunkInfo{
+        size_t mSize = 0;
+        T *mMem = nullptr;
+        T *mCurrent = nullptr;
+
+        DynSizedChunkInfo(size_t n = 0): mSize(n){}
+
+        void clear(){
+            mCurrent = mMem;
+        }
+        T* do_alloc()
+        {
+            if( mCurrent + 1 > mMem + mSize ) return nullptr;
+            auto res = (mCurrent);
+            mCurrent += 1;
+            return res;
+        }
+    };
+
+    struct ConstSizedChunkInfo{
+        T *mMem = nullptr;
+        T *mCurrent = nullptr;
+
+        ConstSizedChunkInfo(size_t ){}
+
+        void clear(){
+            mCurrent = mMem;
+        }
+        T* do_alloc(size_t mSize)
+        {
+            if( mCurrent + 1 > mMem + mSize ) return nullptr;
+            auto res = (mCurrent);
+            mCurrent += 1;
+            return res;
+        }
+    };
+    using ChunkInfo = std::conditional_t<is_const_growth, ConstSizedChunkInfo, DynSizedChunkInfo>;
+    
+
+    ChunkInfo *append_chunk() {
+            size_t n = mChuckSize.next_value();
+            ChunkInfo ch { n };
+            ch.mCurrent = ch.mMem = mAlloc.allocate( n );
+            if( !ch.mMem )
+                return nullptr;
+            return &mChunks.emplace_back(ch);
+    }
+    using ChunkList = std::vector<ChunkInfo>;
+    ChunkSizeGrowthStrategy mChuckSize;
+    Alloc mAlloc;
+    ChunkList mChunks;
+    size_t mCurrChunk;
+};
+
 // allocate when needed
 template<typename T, class Alloc = std::allocator<T> , class FreeList = FreeList<T, std::default_delete<T>> >
 class PoolAllocator  : BasePool<T, FreeList, PoolAllocator<T, Alloc, FreeList> >
@@ -483,11 +628,6 @@ public:
     // pre-allocate memory. memory will be deleted when FreePool destructs.
     // T must be IDeallocatable
     PoolAllocator( const Alloc &a=Alloc(), const FreeList& freeList=FreeList())
-        : parent_type(freeList), mAlloc(a)
-    {
-    }
-
-    PoolAllocator( size_t n, const Alloc &a=Alloc(), const FreeList& freeList=FreeList())
         : parent_type(freeList), mAlloc(a)
     {
     }
@@ -553,6 +693,8 @@ protected:
 
 #ifdef USE_FIXEDPOOL
 typedef FixedPool<Node> NodePool;
+#elif defined( USE_CHUNKPOOL )
+typedef ChunkPool<Node, ConstGrowthStrategy> NodePool;
 #else
 typedef PoolAllocator<Node> NodePool;
 #endif
@@ -598,35 +740,54 @@ int main(int argc, char *argv[])
 //    std::cout << "allocated :" << MemSize << " nodes:" << MaxNodes << " blocksize:" << sizeof(Node) << " stretch_depth:" << stretch_depth << std::endl;
     // Alloc then dealloc stretchdepth tree
     {
+#if defined( USE_FIXEDPOOL )
         NodePool store(MaxNodes);
+#elif defined( USE_CHUNKPOOL )
+        NodePool store(1024);
+#else
+        NodePool store;
+#endif
         auto c = make(stretch_depth, store);
         std::cout << "stretch tree of depth " << stretch_depth << "\t "
                   << "check: " << c->check() << std::endl;
     }
 
-    NodePool long_lived_store(MaxNodes);
-    auto long_lived_tree = make(max_depth, long_lived_store);
+#if defined( USE_FIXEDPOOL )
+        NodePool long_lived_store(MaxNodes);
+#elif defined( USE_CHUNKPOOL )
+        NodePool long_lived_store(1024);
+#else
+        NodePool long_lived_store;
+#endif
+
     std::cout << "starting..." << std::endl;
+    auto long_lived_tree = make(max_depth, long_lived_store);
 
     // buffer to store output of each thread
     char *outputstr = (char*)malloc(LINE_SIZE * (max_depth +1) * sizeof(char));
 
-    static FreeList<Node> *s_freeList;
-    #pragma omp threadprivate(s_freeList)
-    #pragma omp parallel 
-    {
-        s_freeList = new FreeList<Node>;
-    }
+//    static FreeList<Node> *s_freeList;
+//    #pragma omp threadprivate(s_freeList)
+//    #pragma omp parallel 
+//    {
+//        s_freeList = new FreeList<Node>;
+//    }
     
     #pragma omp parallel for 
     for (int d = min_depth; d <= max_depth; d += 2) 
     {
-        auto & freeList= *s_freeList;
+//        auto & freeList= *s_freeList;
         int iterations = 1 << (max_depth - d + min_depth);
         int c = 0;
 
         // Create a memory pool for this thread to use.
+#if defined( USE_FIXEDPOOL )
         NodePool store(CalcNodes(d));
+#elif defined( USE_CHUNKPOOL )
+        NodePool store(1024);
+#else
+        NodePool store;
+#endif
 //        NodePool store(0, {}, freeList);
 
         for (int i = 1; i <= iterations; ++i) 
