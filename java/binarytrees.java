@@ -52,6 +52,8 @@ public class binarytrees {
         EXECUTOR_SERVICE.shutdown();
         EXECUTOR_SERVICE.awaitTermination(120L, TimeUnit.SECONDS);
 
+        long tsStop = System.currentTimeMillis();
+
         for (final String str : results) {
             System.out.println(str);
         }
@@ -59,8 +61,7 @@ public class binarytrees {
         System.out.println("long lived tree of depth " + maxDepth + 
             "\t check: " + longLivedTree.itemCheck());
 
-        long tsStop = System.currentTimeMillis();
-         System.out.println("- java processing time (ms): " + (tsStop-tsStart));
+        System.out.println("- java processing time (ms): " + (tsStop-tsStart));
     }
 
     private static TreeNode bottomUpTree(final int depth) {

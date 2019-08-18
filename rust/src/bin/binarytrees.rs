@@ -9,6 +9,7 @@
 extern crate typed_arena;
 extern crate rayon;
 
+use std::time::{SystemTime};
 use typed_arena::Arena;
 use rayon::prelude::*;
 
@@ -45,6 +46,7 @@ fn inner(depth: i32, iterations: i32) -> String {
 }
 
 fn main() {
+    let start_time = SystemTime::now();
     let n = std::env::args().nth(1)
         .and_then(|n| n.parse().ok())
         .unwrap_or(10);
@@ -67,9 +69,13 @@ fn main() {
             inner(depth, iterations)
         }).collect::<Vec<_>>();
 
+    let duration = start_time.elapsed().unwrap();
+
     for message in messages {
         println!("{}", message);
     }
+
+    println!(" rust time:{}ms", duration.as_millis());
 
     println!("long lived tree of depth {}\t check: {}", max_depth, item_check(long_lived_tree));
 }

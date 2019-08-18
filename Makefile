@@ -8,21 +8,21 @@ run: run_binarytrees_cpp run_binarytrees_java run_binarytrees_rust run_binarytre
 build: build_binarytrees_java build_binarytrees_cpp build_binarytrees_go build_binarytrees_rust
 
 CXX ?= /usr/local/builds/gcc/latest/bin/g++
-#CXX = g++
+#CXX ?= g++
 
 ###### run #####
 run_binarytrees_cpp: build_binarytrees_cpp
-	cd cpp && time LD_LIBRARY_PATH=`dirname $(CXX)`/../lib64 ./binarytrees 21
-#	cd cpp && time ./binarytrees 21
+	cd cpp && time ./binarytrees 21
+#	cd cpp && time LD_LIBRARY_PATH=`which g++ | xargs readlink -e | xargs dirname`/../lib64 ./binarytrees 21
 
 run_binarytrees_java: build_binarytrees_java
-	cd java && time java binarytrees 21
+	cd java && java -version && time java binarytrees 21
 
 run_binarytrees_go: build_binarytrees_go
-	cd go && time ./binarytrees 21
+	cd go && go version && time ./binarytrees 21
 
 run_binarytrees_rust: build_binarytrees_rust
-	cd rust && time cargo run --release --bin binarytrees 21
+	cd rust && rustc --version && time cargo run --release --bin binarytrees 21
 
 ###### build #####
 build_binarytrees_cpp: cpp/binarytrees.cpp

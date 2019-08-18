@@ -18,12 +18,14 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"time"
 )
 
 var minDepth = 4
 var n = 0
 
 func main() {
+	startTime := time.Now()
 	runtime.GOMAXPROCS(runtime.NumCPU() * 2)
 
 	flag.Parse()
@@ -63,11 +65,15 @@ func main() {
 	}
 	wg.Wait()
 
+	duration := time.Now().Sub(startTime)
+
 	for depth := minDepth; depth <= maxDepth; depth += 2 {
 		fmt.Printf("%d\t trees of depth %d\t check: %d\n",
 			result_trees[depth], depth, result_check[depth],
 		)
 	}
+
+	fmt.Printf(" - golang time: %v\t", duration)
 	fmt.Printf("long lived tree of depth %d\t check: %d\n",
 		maxDepth, longLivedTree.ItemCheck(),
 	)
