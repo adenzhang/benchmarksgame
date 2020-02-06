@@ -380,8 +380,8 @@ protected:
 using EventQueue = SPMCQueue<int>;
 //using EventQue = BlockingQueue<int>;
 
-//using Pool = PooledAllocator<Node>;
-using Pool = NodePool;
+using Pool = PooledAllocator<Node>;
+//using Pool = NodePool;
 int main(int argc, char *argv[]) 
 {
     auto tsStart = std::chrono::steady_clock::now();
@@ -415,7 +415,7 @@ int main(int argc, char *argv[])
     if( que.size() != nEvents ) {
         std::cout << "wrong size " << nEvents << que.size() << std::endl;
     }
-/*    {
+    
     unsigned int nThreads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
     threads.reserve(nThreads);
@@ -450,7 +450,8 @@ int main(int argc, char *argv[])
     for(auto& thr: threads ) {
         thr.join();
     }
-*/
+
+    /*
     #pragma omp parallel for   
     for (int d = min_depth; d <= max_depth; d += 2) 
     {
@@ -471,7 +472,7 @@ int main(int argc, char *argv[])
         sprintf(outputstr + LINE_SIZE * d, "%d\t trees of depth %d\t check: %d\n",
            iterations, d, c);
     }
-
+*/
     auto tsStop = std::chrono::steady_clock::now();
     // print all results
     for (int d = min_depth; d <= max_depth; d += 2) 

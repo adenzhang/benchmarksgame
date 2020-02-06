@@ -61,7 +61,7 @@ public class binarytrees {
         System.out.println("long lived tree of depth " + maxDepth + 
             "\t check: " + longLivedTree.itemCheck());
 
-        System.out.println("- java processing time (ms): " + (tsStop-tsStart));
+        System.out.println(" -- java processing time (ms): " + (tsStop-tsStart));
     }
 
     private static TreeNode bottomUpTree(final int depth) {

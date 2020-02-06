@@ -75,7 +75,7 @@ fn main() {
         println!("{}", message);
     }
 
-    println!(" rust time:{}ms", duration.as_millis());
+    println!(" -- rust time:{}ms", duration.as_millis());
 
     println!("long lived tree of depth {}\t check: {}", max_depth, item_check(long_lived_tree));
 }

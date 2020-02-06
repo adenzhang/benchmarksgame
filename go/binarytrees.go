@@ -73,7 +73,7 @@ func main() {
 		)
 	}
 
-	fmt.Printf(" - golang time: %v\t", duration)
+	fmt.Printf(" -- golang time: %v\n", duration)
 	fmt.Printf("long lived tree of depth %d\t check: %d\n",
 		maxDepth, longLivedTree.ItemCheck(),
 	)
