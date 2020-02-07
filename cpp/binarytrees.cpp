@@ -145,6 +145,7 @@ struct StaticFnDeleter
 
     void operator()( T *p )
     {
+        p->~T();
         deallocate( p );
     }
 };
@@ -280,6 +281,7 @@ public:
     {
         for(size_t i=0; i< nReserve; ++i) {
             if( auto p = reinterpret_cast<T*>( m_alloc.allocate(1) ) ) {
+                ++m_nAllocated;
                 deallocate( p );
             }else
                 break;
@@ -288,8 +290,11 @@ public:
     T* allocate()
     {
         auto p = m_freeList.pop();
-        if( p ) 
+        if( p ) {
+            --m_nFree;
             return p;
+        }
+        ++m_nAllocated; // note: allocate may fail.
         return reinterpret_cast<T*>( m_alloc.allocate(1) );
     }
 
@@ -302,6 +307,7 @@ public:
 
     void deallocate( T* p, size_t = 1) {
         m_freeList.push( *p );
+        ++m_nFree;
     }
 
     static void Delete( void *self, T* p)
@@ -315,11 +321,16 @@ public:
     }
 
     ~PooledAllocator(){        
+        if( m_nAllocated != m_nFree  ) 
+            std::cout << "allocated: " << m_nAllocated << ", in FreeList: " << m_nFree << std::endl;
+        assert( m_nAllocated == m_nFree );
         // if m_alloc.deallocate(size_t), deallocate one by one.
     }
 protected:
     Alloc m_alloc;
     FreeList m_freeList;
+    size_t m_nAllocated = 0;
+    size_t m_nFree = 0;
 };
 
 struct Node 
@@ -676,7 +687,7 @@ int main(int argc, char *argv[])
                        iterations, depth, c);
                     nEvents.fetch_sub(1);
                 }
-                assert( que.stopping() );
+                // assert( que.stopping() );
             } ) );
     }
     while( nEvents.load() > 0 )
