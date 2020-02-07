@@ -19,77 +19,312 @@
 #include <atomic>
 #include <condition_variable>
 #include <cassert>
+#include <algorithm>
 
 const size_t    LINE_SIZE = 64;
 
+struct DoubleAccumulatedGrowthPolicy{
+    DoubleAccumulatedGrowthPolicy( size_t n ) : m_val(std::max(size_t(1), n)) {}
 
-template<class T, class AllocT = std::allocator<T>>
+    size_t grow_to(size_t currVal) {
+        return std::max(m_val, currVal * 2); 
+    }
+    size_t &get_grow_value() {
+        return m_val;
+    }
+private:
+    size_t m_val;
+};
+
+struct DoublePrevGrowthPolicy{
+    DoublePrevGrowthPolicy( size_t n ) : m_val(std::max(size_t(1), n)) {}
+    size_t grow_to(size_t ) {
+        return (m_val *= 2); 
+    }
+    size_t &get_grow_value() {
+        return m_val;
+    }
+private:
+    size_t m_val;
+};
+
+struct ConstGrowthPolicy{
+    ConstGrowthPolicy( size_t n ) : m_val(std::max(size_t(1), n)) {}
+    size_t grow_to(size_t) const {
+        return m_val ; 
+    }
+    size_t &get_grow_value() {
+        return m_val;
+    }
+private:
+    size_t m_val;
+};
+
+template<class Int>
+constexpr Int roundup(Int x, Int align)
+{
+    return x % align ? (x + (align - x % align) ) : x;
+}
+inline constexpr bool is_pow2( std::size_t n )
+{
+    return n != 0 && ( n & ( n - 1 ) ) == 0;
+}
+
+// @brief FreeList traits:
+///    - typename Node
+///    - FreeList(FreeList&& )
+///    - T *pop()
+///    - void push(T &)
+///    - bool empty() const
+template<class T>
+struct FreeList
+{
+    struct FreeNode
+    {
+        FreeNode *pNext;
+
+        FreeNode( T *next = nullptr ) : pNext( reinterpret_cast<FreeNode *>( next ) )
+        {
+        }
+        FreeNode( FreeNode *next = nullptr ) : pNext( next )
+        {
+        }
+    };
+    using Node = FreeNode;
+
+    // static_assert( sizeof( T ) >= sizeof( FreeNode * ), "sizeof T < sizeof(void *)" );
+
+    FreeList() = default;
+    FreeList( FreeList&& a){
+        pHead = a.pHead;
+        a.pHead = nullptr;
+    }
+
+    void push( T &p )
+    {
+        new ( reinterpret_cast<FreeNode *>( &p ) ) FreeNode( pHead );
+        pHead = reinterpret_cast<FreeNode *>( &p );
+    }
+
+    T *pop()
+    {
+        T *res = reinterpret_cast<T *>( pHead );
+        if ( pHead )
+            pHead = pHead->pNext;
+        return res;
+    }
+    bool empty() const
+    {
+        return !pHead;
+    }
+    // FreeList(const FreeList&) = delete;
+    FreeNode *pHead = nullptr;
+};
+/// @brief StaticFnDeleter call fn(D*, T*) to delete object.
+template<class T>
+struct StaticFnDeleter
+{
+    using D = void *;
+    using DelFn = void ( * )( D, T * );
+
+    DelFn pDelFn = nullptr;
+    D pDeleter = D();
+
+    template<class DT>
+    StaticFnDeleter( DelFn pF, DT pD ) : pDelFn( pF ), pDeleter( static_cast<D>( pD ) )
+    {
+    }
+
+    StaticFnDeleter() = default;
+
+    void deallocate( T *p )
+    {
+        assert( pDelFn );
+        ( *pDelFn )( pDeleter, p );
+    }
+
+    void operator()( T *p )
+    {
+        deallocate( p );
+    }
+};
+
+// The cache line size is 64 bytes (on modern intel x86_64 processors), but we use 128 bytes to avoid false sharing because the 
+// prefetcher may read two cache lines.  See section 2.1.5.4 of the intel manual:
+// http://www.intel.com/content/dam/doc/manual/64-ia-32-architectures-optimization-manual.pdf
+// This is also the value intel uses in TBB to avoid false sharing: 
+// https://www.threadingbuildingblocks.org/docs/help/reference/memory_allocation/cache_aligned_allocator_cls.htm
+// FALSE_SHARING_SIZE 128
+template<class T, class GrowthPolicy = DoubleAccumulatedGrowthPolicy, size_t Align = 128>
+class ChunkAllocator : protected GrowthPolicy
+{
+    // memory layout : ChunckInfo| slot1 | slot2 | ... |
+    // size of ChunckInfo is same as size of slot.
+    struct ChunkInfo;
+
+    struct Slot {
+        // unsigned m_index; 
+        T m_data;
+
+        T &getData(){
+            return m_data;
+        }
+    };
+    
+    struct ChunkInfo{
+        ChunkInfo *m_pNext = nullptr;
+        unsigned m_cap = 0;  // doesn't count ChunckInfo block.
+        unsigned m_size = 0; // doesn't count ChunckInfo block.
+
+        void init(unsigned cap){
+            m_cap = cap;
+            m_size = 0;
+            m_pNext = nullptr;
+        }
+        // return updated size
+        unsigned incSize() {
+            return m_cap == m_size ? 0 : ++m_size;
+        }
+
+        bool full() const {
+            return m_cap == m_size;
+        }
+
+        void addNext(ChunkInfo *p) {
+            m_pNext = p;
+        } 
+    };
+    static constexpr size_t ChunkInfoSize = roundup( sizeof(ChunkInfo), Align );
+    static constexpr size_t SlotSize = roundup( sizeof(Slot), Align );
+    static constexpr bool IsPOD = std::is_pod<T>::value;
+
+    static Slot &getSlot(ChunkInfo& info, size_t k ) {
+        return *reinterpret_cast<Slot*>( reinterpret_cast<char*>(&info) +  ChunkInfoSize + SlotSize *k);
+    }
+    // static ChunkInfo& getChunkInfo(Slot& slot){
+    //     return *static_cast<ChunkInfo*>( reinterpret_cast<char*>(&info)  - slot.m_index * SlotSize - ChunkInfoSize);
+    // }
+
+    static Slot *allocate_slot(ChunkInfo& info) {
+        return info.incSize() ? &getSlot(info, info.m_size-1) : nullptr;
+    }
+
+    static ChunkInfo *allocate_chunk( size_t nSlots ) {
+        assert( nSlots );
+        auto pChunk = static_cast<ChunkInfo*>( std::aligned_alloc(Align, ChunkInfoSize + SlotSize * nSlots ) );
+        if( pChunk ) {
+            pChunk->init( nSlots );
+        }
+        // std::cout << "alloc addr: "<< pChunk << ", slots:" << nSlots << std::endl;
+        assert( pChunk );
+        return pChunk;
+    }
+
+public:
+    ChunkAllocator( size_t nReserve=0, size_t growthParam = 0 ) : GrowthPolicy( growthParam ? growthParam : nReserve )
+    {
+        if( nReserve > 0 )
+            add_chunk( nReserve );
+    }
+
+    // copy constructor only copies parameters, not memory.
+    ChunkAllocator(const ChunkAllocator &a) : ChunkAllocator( a.m_totalSlots, a.get_grow_value())
+    {}
+    ChunkAllocator(ChunkAllocator&& a) : GrowthPolicy(a.get_grow_value()),  m_totalSlots( a.m_totalSlots ), m_pChunkList( a.m_pChunkList )
+    {
+        a.m_pChunkList = nullptr;
+    }
+    ~ChunkAllocator()
+    {
+        destroy();
+    }
+
+    T *allocate(size_t = 1)
+    {
+        if( !m_pChunkList || m_pChunkList->full() ) 
+            add_chunk( GrowthPolicy::grow_to( m_totalSlots )  );
+        assert( m_pChunkList );
+        assert( !m_pChunkList->full() );
+        return &allocate_slot( *m_pChunkList )->getData();
+    }
+
+    // destroy all, but no deallocate provided.
+    void destroy()
+    {
+        while( m_pChunkList ) {
+            auto p = m_pChunkList;
+            m_pChunkList = m_pChunkList->m_pNext;
+            // std::cout << "free addr:" << p << ", slots:" << p->m_cap << std::endl;
+            std::free( p );
+        }
+        m_totalSlots = 0;
+    }
+protected:
+    void add_chunk( size_t nSlots )
+    {
+        auto pChunk = allocate_chunk( nSlots );
+        pChunk->addNext( m_pChunkList );
+        m_pChunkList = pChunk;
+        m_totalSlots += nSlots;
+    }
+    size_t m_totalSlots = 0;
+    ChunkInfo *m_pChunkList = nullptr;
+};
+
+template<class T, class Alloc = ChunkAllocator<T>, class FreeList = FreeList<T>>
 class PooledAllocator
 {
-    struct Node {
-        char val[sizeof(T)];
-        T *getData() {
-            return reinterpret_cast<T*>(val);
-        }
-        Node *& next(){
-            return reinterpret_cast<Node *&>(val);
-        }
-        static Node *From( T* p) {
-            return reinterpret_cast<Node *>(p);
-        }
-    };
-//    static_assert( sizeof(Node) <= sizeof(T), "Too small T");
 public:
-    struct Deleter{
-        PooledAllocator *alloc = nullptr;
-
-        Deleter(PooledAllocator *a= nullptr):alloc(a){}
-        void operator()( T* p ) const {
-            alloc->deallocate(p);
-        }
-    };
-
-    using Alloc = typename std::allocator_traits<AllocT>::template rebind_alloc<Node>;
-    PooledAllocator(size_t nReserve = 0, const Alloc &alloc = Alloc() ): m_alloc(alloc)
+    // using Alloc = typename std::allocator_traits<AllocT>::template rebind_alloc<typename FreeList::Node>;
+    PooledAllocator(size_t nReserve = 0, Alloc &&alloc = Alloc() ): m_alloc(std::move(alloc))
     {
         for(size_t i=0; i< nReserve; ++i) {
-            if( auto p = m_alloc.allocate(1) ) {
-                deallocate( p->getData() );
+            if( auto p = reinterpret_cast<T*>( m_alloc.allocate(1) ) ) {
+                deallocate( p );
             }else
                 break;
         }
     }
     T* allocate()
     {
-        if( m_freeList ) {
-            auto pFirst = m_freeList;
-            m_freeList = pFirst->next();
-            return pFirst->getData();
-        }
-        return m_alloc.allocate(1)->getData();
+        auto p = m_freeList.pop();
+        if( p ) 
+            return p;
+        return reinterpret_cast<T*>( m_alloc.allocate(1) );
     }
 
     template<class...Args>
-    std::unique_ptr<T, Deleter> create_unique(Args&&... args) {
+    std::unique_ptr<T, StaticFnDeleter<T> > create_unique(Args&&... args) {
         auto p = allocate();
         new (p) T( std::forward<Args>(args)... );
-        return std::unique_ptr<T, Deleter>( p, Deleter(this) );
+        return std::unique_ptr<T, StaticFnDeleter<T> >( p, get_deleter() );
     }
 
-    void deallocate( T* p, size_t n = 1) {
-        auto pN = Node::From(p);
-        pN->next() = m_freeList;
-        m_freeList = pN;
-        
+    void deallocate( T* p, size_t = 1) {
+        m_freeList.push( *p );
+    }
+
+    static void Delete( void *self, T* p)
+    {
+        reinterpret_cast<PooledAllocator*>(self)->deallocate(p);
+    }
+
+    StaticFnDeleter<T> get_deleter() 
+    {
+        return StaticFnDeleter<T> ( Delete, this );
+    }
+
+    ~PooledAllocator(){        
+        // if m_alloc.deallocate(size_t), deallocate one by one.
     }
 protected:
     Alloc m_alloc;
-    Node *m_freeList = nullptr;
+    FreeList m_freeList;
 };
 
 struct Node 
 {
-    using Deleter =  typename PooledAllocator<Node>::Deleter ;
+    using Deleter =  StaticFnDeleter<Node> ;
     using Ptr = std::unique_ptr<Node, Deleter > ;
 
     Ptr l, r;
@@ -203,8 +438,8 @@ public:
             return false;
         assert( m_data[iEnd].flag.load(std::memory_order_acquire) == false ); 
         m_data[iEnd].val = val;
+        assert( !m_data[iEnd].flag );
         m_data[iEnd].flag.store(true, std::memory_order_release);
-        assert( !oldVal );
         m_end.fetch_add( 1 );
         return true;
     }
@@ -378,7 +613,7 @@ protected:
 };
 
 using EventQueue = SPMCQueue<int>;
-//using EventQue = BlockingQueue<int>;
+//using EventQueue = BlockingQueue<int>;
 
 using Pool = PooledAllocator<Node>;
 //using Pool = NodePool;
