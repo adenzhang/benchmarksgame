@@ -15,128 +15,130 @@
 #include <apr_pools.h>
 #include <chrono>
 
-const size_t    LINE_SIZE = 64;
+const size_t LINE_SIZE = 64;
 
 class Apr
 {
 public:
-    Apr() 
+    Apr()
     {
         apr_initialize();
     }
 
-    ~Apr() 
+    ~Apr()
     {
         apr_terminate();
     }
 };
 
-struct Node 
+struct Node
 {
     Node *l, *r;
-    
-    int check() const 
+
+    int check() const
     {
-        if (l)
+        if ( l )
             return l->check() + 1 + r->check();
-        else return 1;
+        else
+            return 1;
     }
 };
 
 class NodePool
 {
 public:
-    NodePool() 
+    NodePool()
     {
-        apr_pool_create_unmanaged(&pool);
+        apr_pool_create_unmanaged( &pool );
     }
 
-    ~NodePool() 
+    ~NodePool()
     {
-        apr_pool_destroy(pool);
+        apr_pool_destroy( pool );
     }
 
-    Node* alloc()
+    Node *alloc()
     {
-        return (Node *)apr_palloc(pool, sizeof(Node));
+        return (Node *)apr_palloc( pool, sizeof( Node ) );
     }
 
     void clear()
     {
-        apr_pool_clear(pool);
+        apr_pool_clear( pool );
     }
 
 private:
-    apr_pool_t* pool;
+    apr_pool_t *pool;
 };
 
-Node *make(int d, NodePool &store)
+Node *make( int d, NodePool &store )
 {
-    Node* root = store.alloc();
+    Node *root = store.alloc();
 
-    if(d>0){
-        root->l=make(d-1, store);
-        root->r=make(d-1, store);
-    }else{
-        root->l=root->r=0;
+    if ( d > 0 )
+    {
+        root->l = make( d - 1, store );
+        root->r = make( d - 1, store );
+    }
+    else
+    {
+        root->l = root->r = 0;
     }
 
     return root;
 }
 
-int main(int argc, char *argv[]) 
+int main( int argc, char *argv[] )
 {
     auto tsStart = std::chrono::steady_clock::now();
     Apr apr;
     int min_depth = 4;
-    int max_depth = std::max(min_depth+2,
-                             (argc == 2 ? atoi(argv[1]) : 10));
-    int stretch_depth = max_depth+1;
+    int max_depth = std::max( min_depth + 2, ( argc == 2 ? atoi( argv[1] ) : 10 ) );
+    int stretch_depth = max_depth + 1;
 
     // Alloc then dealloc stretchdepth tree
     {
         NodePool store;
-        Node *c = make(stretch_depth, store);
+        Node *c = make( stretch_depth, store );
         std::cout << "stretch tree of depth " << stretch_depth << "\t "
                   << "check: " << c->check() << std::endl;
     }
 
     NodePool long_lived_store;
-    Node *long_lived_tree = make(max_depth, long_lived_store);
+    Node *long_lived_tree = make( max_depth, long_lived_store );
 
     // buffer to store output of each thread
-    char *outputstr = (char*)malloc(LINE_SIZE * (max_depth +1) * sizeof(char));
+    char *outputstr = (char *)malloc( LINE_SIZE * ( max_depth + 1 ) * sizeof( char ) );
 
-    #pragma omp parallel for 
-    for (int d = min_depth; d <= max_depth; d += 2) 
+#pragma omp parallel for
+    for ( int d = min_depth; d <= max_depth; d += 2 )
     {
-        int iterations = 1 << (max_depth - d + min_depth);
+        int iterations = 1 << ( max_depth - d + min_depth );
         int c = 0;
 
         // Create a memory pool for this thread to use.
         NodePool store;
 
-        for (int i = 1; i <= iterations; ++i) 
+        for ( int i = 1; i <= iterations; ++i )
         {
-            Node *a = make(d, store);
+            Node *a = make( d, store );
             c += a->check();
             store.clear();
         }
 
         // each thread write to separate location
-        sprintf(outputstr + LINE_SIZE * d, "%d\t trees of depth %d\t check: %d\n",
-           iterations, d, c);
+        sprintf( outputstr + LINE_SIZE * d, "%d\t trees of depth %d\t check: %d\n", iterations, d, c );
     }
 
     auto tsStop = std::chrono::steady_clock::now();
     // print all results
-    for (int d = min_depth; d <= max_depth; d += 2) 
-        printf("%s", outputstr + (d * LINE_SIZE) );
-    free(outputstr);
+    for ( int d = min_depth; d <= max_depth; d += 2 )
+        printf( "%s", outputstr + ( d * LINE_SIZE ) );
+    free( outputstr );
 
     std::cout << "long lived tree of depth " << max_depth << "\t "
-              << "check: " << (long_lived_tree->check()) << "\n";
+              << "check: " << ( long_lived_tree->check() ) << "\n";
 
-    std::cout << " -- cpp time(ms): " << (tsStop - tsStart).count()/1000/1000 << std::endl;
+    std::cout << " -- cpp time(ms): " << ( tsStop - tsStart ).count() / 1000 / 1000 << std::endl;
     return 0;
 }
